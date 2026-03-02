@@ -1,314 +1,143 @@
-# BiteSpeed Identity Reconciliation
-
-A production-grade backend service that identifies and consolidates customer identity across multiple purchases, even when different email addresses and phone numbers are used per order.
+# bitespeed-identity-reconciliation
 
 **Live endpoint:** `https://bitespeed-identity-reconciliation-mlak.onrender.com/identify`
 
----
-
-## Table of Contents
-
-- [Architecture](#architecture)
-- [Identity Merging Logic](#identity-merging-logic)
-- [Transaction Design](#transaction-design)
-- [Concurrency Strategy](#concurrency-strategy)
-- [API Reference](#api-reference)
-- [Running Locally](#running-locally)
-- [Running Tests](#running-tests)
-- [Deployment](#deployment)
-- [Example curl Requests](#example-curl-requests)
+Built for the BiteSpeed backend engineering intern assignment. The service links different orders made with different contact info back to the same person.
 
 ---
 
-## Architecture
+## What it does
 
+When FluxKart gets a checkout event with an email or phone number, it hits `/identify`. The service figures out if this person already exists in the database (maybe under a different email or phone), links everything together, and returns a consolidated view of that contact.
+
+The tricky part is when two previously separate contact clusters turn out to belong to the same person — the service merges them, keeps the oldest one as primary, and re-points everything else underneath it.
+
+---
+
+## Stack
+
+- **Node.js + TypeScript**
+- **Express** — HTTP layer
+- **Prisma + PostgreSQL** (Neon) — database
+- **Zod** — request validation
+- **Winston** — structured logging
+- **Jest** — unit tests
+
+---
+
+## Project structure
 ```
 src/
-├── index.ts                   # Server startup (port binding only)
-├── app.ts                     # Express app, middleware, routes
-├── logger/
-│   └── index.ts               # Winston structured logger
-├── validation/
-│   └── identifySchema.ts      # Zod input validation + parsing
-├── controllers/
-│   └── identifyController.ts  # HTTP concerns: parse → call service → respond
-├── services/
-│   └── identityService.ts     # Business logic + transaction orchestration
-├── repositories/
-│   └── contactRepository.ts   # All DB access (Prisma) isolated here
-├── routes/
-│   └── identify.ts            # DI wiring: repo → service → controller → router
-├── types/
-│   └── contact.ts             # Shared TypeScript interfaces
-└── lib/
-    └── prisma.ts              # Prisma client singleton
+├── index.ts                        # starts the server, nothing else
+├── app.ts                          # express setup, middleware, routes
+├── validation/identifySchema.ts    # zod schema, rejects bad input early
+├── controllers/identifyController  # handles http, calls service, maps errors
+├── services/identityService.ts     # all the business logic lives here
+├── repositories/contactRepository  # every db query in one place
+├── logger/index.ts                 # winston, json in prod / readable in dev
+└── lib/prisma.ts                   # prisma singleton
 ```
 
-**Separation of concerns:**
-
-| Layer | Responsibility |
-|---|---|
-| Validation | Reject malformed input before it reaches the service |
-| Controller | HTTP parsing, calling service, mapping errors to status codes |
-| Service | All business logic, transaction management |
-| Repository | All Prisma queries — the only layer that touches the DB |
-
-This structure makes every layer independently unit-testable and means DB changes are isolated to the repository.
+The idea was to keep each layer doing one thing. The service doesn't know about HTTP. The controller doesn't touch the database. The repository doesn't have any logic. Made testing a lot easier too — the service tests just mock the repo.
 
 ---
 
-## Identity Merging Logic
+## How the merging works
 
-### Core Rules (from BiteSpeed spec)
+1. Incoming request has an email, a phone, or both
+2. Look up all existing contacts that match either value
+3. From those matches, find all the root primaries (following linkedId if needed)
+4. Sort primaries by createdAt — the oldest one wins
+5. If there's more than one primary, merge: demote the newer ones to secondary and re-point their children
+6. Check if the request has any new info not already in the cluster — if yes, create a new secondary
+7. Return the full cluster with primary values first
 
-1. A `Contact` row is `primary` if it is the oldest anchor for a cluster.
-2. All other rows in the cluster are `secondary` and carry a `linkedId` pointing to the primary's `id`.
-3. Two clusters are merged when an incoming request provides a value (email or phone) that exists in each cluster — the older primary wins; the newer primary is demoted.
+---
 
-### Step-by-step flow
+## Transactions
 
-```
-POST /identify { email, phoneNumber }
-        │
-        ▼
-1. Find all active contacts matching email OR phone
-        │
-        ├─ No matches ──► Create new primary → return
-        │
-        ▼
-2. Collect root primary IDs from all matched rows
-   (a primary if linkPrecedence="primary", else follow linkedId)
-        │
-        ▼
-3. Fetch all primaries, sort by createdAt ASC
-   primaries[0] = truePrimary (oldest = stable anchor)
-        │
-        ├─ More than one primary? ──► MERGE:
-        │       • Demote newer primaries to secondary under truePrimary
-        │       • Re-point their existing secondaries to truePrimary
-        │
-        ▼
-4. Fetch full cluster (truePrimary + all its secondaries)
-        │
-        ▼
-5. Does the request introduce new email/phone not yet in cluster?
-        │
-        ├─ Yes ──► Create new secondary linked to truePrimary → re-fetch cluster
-        │
-        ├─ No  ──► Idempotent: return existing cluster unchanged
-        │
-        ▼
-6. Build response (primary values first, secondaries sorted by id ASC)
+The whole flow runs in a single SERIALIZABLE transaction. Without it, two concurrent requests could both think they're the primary, both insert rows, and leave the database in a broken state. Serializable isolation makes PostgreSQL treat concurrent transactions as if they ran one after the other — if there's a conflict, one gets aborted and retries.
+
+There's also a unique constraint on (email, phoneNumber) as a last line of defence. If two identical requests race past the idempotency check at the same moment, only one insert goes through. The other gets a P2002 from Prisma which the controller surfaces as a 409.
+
+---
+
+## Running locally
+
+You'll need Node 18+ and a PostgreSQL database. neon.tech has a free tier that works fine.
+```bash
+git clone https://github.com/developer7620/bitespeed-identity-reconciliation.git
+cd bitespeed-identity-reconciliation
+
+npm install
+
+cp .env.example .env
+# paste your DATABASE_URL into .env
+
+npm run db:push
+npm run db:generate
+
+npm run dev
 ```
 
-**Why oldest = true primary?**
-The spec mandates it, and it gives a stable, monotonically consistent choice. Any two concurrent requests that both observe the same two primaries will always agree on which one to keep — the one with the smaller `createdAt`.
+---
+
+## Tests
+```bash
+npm test
+```
+
+18 tests, no database needed — the repository layer is mocked. Covers new contact creation, secondary creation, cluster merging, idempotency, response ordering, and input validation edge cases.
 
 ---
 
-## Transaction Design
+## API
 
-The entire identify flow runs inside a single `SERIALIZABLE` PostgreSQL transaction via `prisma.$transaction`.
-
-**Why a transaction is critical:**
-
-Without it, steps 1–5 above are separate DB round-trips. Between any two steps, a concurrent request can:
-- Insert a duplicate secondary (same email+phone, different `id`)
-- Merge a cluster that the current request has already read (split-brain)
-- Observe a half-demoted primary (one `updateMany` committed, the other not)
-
-`SERIALIZABLE` isolation means PostgreSQL guarantees the net effect is identical to serial execution. Any conflicting concurrent transaction is aborted and must retry. This eliminates all of the above races.
-
-**Last-resort guard:** The schema carries a unique constraint on `(email, phoneNumber)`. Even if two identical requests somehow both pass the idempotency check simultaneously, only one `INSERT` will succeed at the DB level. The loser receives a Prisma `P2002` error, which the controller surfaces as HTTP 409.
-
----
-
-## Concurrency Strategy
-
-| Scenario | How it is handled |
-|---|---|
-| Two requests merge different clusters simultaneously | `SERIALIZABLE` transaction aborts one; it retries and sees the already-merged state |
-| Two identical requests hit at the same time | Idempotency check inside transaction; DB unique constraint as fallback |
-| One request inserts while another reads the cluster | Transaction isolation prevents dirty reads |
-
-No application-level mutexes or Redis locks are needed — PostgreSQL's MVCC + serializable isolation is sufficient for this workload.
-
----
-
-## API Reference
-
-### `POST /identify`
-
-**Request** (JSON body):
+### POST /identify
 ```json
-{
-  "email": "string (optional)",
-  "phoneNumber": "string or number (optional)"
-}
+{ "email": "mcfly@hillvalley.edu", "phoneNumber": "123456" }
 ```
-At least one field must be non-null. Email must be a valid format. Phone must be 5–15 digits (E.164-ish), with optional leading `+`.
-
-**Response 200:**
 ```json
 {
   "contact": {
     "primaryContatctId": 1,
-    "emails": ["primary@example.com", "other@example.com"],
-    "phoneNumbers": ["123456", "789012"],
-    "secondaryContactIds": [2, 3]
+    "emails": ["lorraine@hillvalley.edu", "mcfly@hillvalley.edu"],
+    "phoneNumbers": ["123456"],
+    "secondaryContactIds": [23]
   }
 }
 ```
 
-**Response 400** (validation failure):
-```json
-{
-  "error": "Validation failed",
-  "details": [
-    { "path": "email", "message": "Invalid email format" }
-  ]
-}
-```
+At least one of email or phoneNumber is required. Phone accepts strings or numbers (5-15 digits). Returns 400 with details on validation failure, 409 on rare concurrent conflict.
 
-**Response 409** (rare concurrent conflict — safe to retry):
-```json
-{ "error": "Concurrent request conflict. Please retry." }
-```
+### GET /
 
-### `GET /`
-Health check. Returns `{ "status": "ok" }`.
+Health check, returns `{ "status": "ok" }`.
 
 ---
 
-## Running Locally
-
-### Prerequisites
-- Node.js ≥ 18
-- PostgreSQL (local install, or free cloud: [neon.tech](https://neon.tech))
-
-### Steps
-
+## Example requests
 ```bash
-# 1. Clone
-git clone https://github.com/YOUR_USERNAME/bitespeed-identity-reconciliation.git
-cd bitespeed-identity-reconciliation
-
-# 2. Install
-npm install
-
-# 3. Configure environment
-cp .env.example .env
-# Edit .env — set DATABASE_URL to your PostgreSQL connection string
-
-# 4. Push schema to DB + generate Prisma client
-npm run db:push
-npm run db:generate
-
-# 5. Start development server (hot-reload)
-npm run dev
-# → Server running on http://localhost:3000
-
-# 6. Build + start production server
-npm run build
-npm start
-```
-
----
-
-## Running Tests
-
-```bash
-# Run all tests
-npm test
-
-# Run with coverage report
-npm run test:coverage
-```
-
-Tests are unit tests only — they mock the repository layer and run without a DB connection. Every major code path is covered:
-
-| Test | What it verifies |
-|---|---|
-| New contact creation | New primary created when no matches |
-| Only email | Null phone handled correctly |
-| Only phone | Null email handled correctly |
-| Secondary creation | New secondary when new info arrives |
-| Idempotency | No duplicate rows for repeated requests |
-| Primary-to-primary merge | Older cluster wins, newer demoted |
-| Response ordering | Primary values first, IDs sorted |
-| Validation — valid inputs | Email, phone, both, numeric phone |
-| Validation — invalid inputs | Missing both, bad email, short phone |
-
----
-
-## Deployment
-
-### Render (free tier) — recommended
-
-1. Push repo to GitHub.
-2. Go to [render.com](https://render.com) → **New Web Service** → connect repo.
-3. Configure:
-   - **Build Command:** `npm install && npm run db:generate && npm run build`
-   - **Start Command:** `npm start`
-4. Add Environment Variables:
-   - `DATABASE_URL` — from [neon.tech](https://neon.tech) (free PostgreSQL)
-   - `NODE_ENV` = `production`
-   - `LOG_LEVEL` = `info`
-5. Deploy → copy the public URL into this README.
-
-### After deploying
-
-Run the migration against your production DB once:
-```bash
-DATABASE_URL="<your-prod-url>" npx prisma db push
-```
-
----
-
-## Example curl Requests
-
-### New customer
-```bash
+# new contact
 curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
   -d '{"email":"lorraine@hillvalley.edu","phoneNumber":"123456"}'
-```
 
-### Same phone, new email → creates secondary
-```bash
+# same phone, new email — creates a secondary
 curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
   -d '{"email":"mcfly@hillvalley.edu","phoneNumber":"123456"}'
-```
 
-### Lookup by email only
-```bash
+# merge two clusters — first create them separately, then bridge
 curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
-  -d '{"email":"lorraine@hillvalley.edu"}'
-```
+  -d '{"email":"george@hillvalley.edu","phoneNumber":"919191"}'
 
-### Trigger cluster merge
-```bash
-# First create two independent contacts
-curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
-  -d '{"email":"george@hillvalley.edu","phoneNumber":"919191"}' \
-  -H "Content-Type: application/json"
-
-curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
-  -d '{"email":"biff@hillvalley.edu","phoneNumber":"717171"}' \
-  -H "Content-Type: application/json"
-
-# Now bridge them — this merges the two clusters
-curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
-  -d '{"email":"george@hillvalley.edu","phoneNumber":"717171"}' \
-  -H "Content-Type: application/json"
-```
-
-### Validation error
-```bash
 curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
-  -d '{}'
-# → 400 { "error": "Validation failed", "details": [...] }
+  -d '{"email":"biff@hillvalley.edu","phoneNumber":"717171"}'
+
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
+  -H "Content-Type: application/json" \
+  -d '{"email":"george@hillvalley.edu","phoneNumber":"717171"}'
 ```

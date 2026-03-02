@@ -1,0 +1,49 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Prisma Schema — BiteSpeed Identity Reconciliation
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Contact {
+  id             Int       @id @default(autoincrement())
+  phoneNumber    String?
+  email          String?
+  linkedId       Int?
+  // "primary"   — oldest contact in the cluster, no linkedId
+  // "secondary" — linked to a primary via linkedId
+  linkPrecedence String
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime? // soft-delete; never hard-delete rows
+
+  // Self-referential relation: secondary → primary
+  linkedContact     Contact?  @relation("ContactLink", fields: [linkedId], references: [id])
+  secondaryContacts Contact[] @relation("ContactLink")
+
+  // ── Indexes ─────────────────────────────────────────────────────────────
+  // Individual indexes power the OR lookup in the identify query.
+  // Partial index on deletedAt=null would be ideal but Prisma doesn't expose
+  // that syntax; the full index still provides significant speedup.
+  @@index([email])
+  @@index([phoneNumber])
+  @@index([linkedId])
+
+  // Composite index: speeds up the "fetch full cluster" query
+  // (WHERE id = X OR linkedId = X ORDER BY createdAt ASC).
+  @@index([linkedId, createdAt])
+
+  // Composite index: prevents duplicate active rows with the same
+  // (email, phoneNumber) pair — a DB-level guard against race conditions
+  // where two concurrent requests might try to insert the same secondary.
+  // NULL values are not considered equal in PostgreSQL unique constraints,
+  // so rows with NULLs are still permitted (correct behaviour here).
+  @@unique([email, phoneNumber], name: "unique_email_phone")
+}

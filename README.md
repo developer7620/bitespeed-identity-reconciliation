@@ -2,7 +2,7 @@
 
 A production-grade backend service that identifies and consolidates customer identity across multiple purchases, even when different email addresses and phone numbers are used per order.
 
-**Live endpoint:** `https://YOUR_APP.onrender.com/identify`
+**Live endpoint:** `https://bitespeed-identity-reconciliation-mlak.onrender.com/identify`
 
 ---
 
@@ -269,21 +269,21 @@ DATABASE_URL="<your-prod-url>" npx prisma db push
 
 ### New customer
 ```bash
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
   -d '{"email":"lorraine@hillvalley.edu","phoneNumber":"123456"}'
 ```
 
 ### Same phone, new email → creates secondary
 ```bash
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
   -d '{"email":"mcfly@hillvalley.edu","phoneNumber":"123456"}'
 ```
 
 ### Lookup by email only
 ```bash
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
   -d '{"email":"lorraine@hillvalley.edu"}'
 ```
@@ -291,23 +291,23 @@ curl -X POST https://YOUR_APP.onrender.com/identify \
 ### Trigger cluster merge
 ```bash
 # First create two independent contacts
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -d '{"email":"george@hillvalley.edu","phoneNumber":"919191"}' \
   -H "Content-Type: application/json"
 
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -d '{"email":"biff@hillvalley.edu","phoneNumber":"717171"}' \
   -H "Content-Type: application/json"
 
 # Now bridge them — this merges the two clusters
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -d '{"email":"george@hillvalley.edu","phoneNumber":"717171"}' \
   -H "Content-Type: application/json"
 ```
 
 ### Validation error
 ```bash
-curl -X POST https://YOUR_APP.onrender.com/identify \
+curl -X POST https://bitespeed-identity-reconciliation-mlak.onrender.com/identify \
   -H "Content-Type: application/json" \
   -d '{}'
 # → 400 { "error": "Validation failed", "details": [...] }
